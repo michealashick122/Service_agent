@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+python-dotenv
+openai
+langchain
+langchain-openai
+asyncpg>=0.28.0
+psycopg2-binary>=2.9.7  

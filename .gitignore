@@ -1,0 +1,50 @@
+# Virtual environment folders
+venv/
+venv311/
+mtvenv/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Environment variables
+.env
+
+# Database files
+*.db
+*.sqlite3
+
+# VSCode settings
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Package installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Build and distribution folders
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Node-related (if you have JS files)
+node_modules/
+
+# Misc
+*.old
