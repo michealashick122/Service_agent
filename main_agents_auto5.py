@@ -414,7 +414,7 @@ service_mapper = AIServiceMapper()
 INTENT_SYS = (
     "You classify event-planning queries quickly. "
     "Return ONLY a JSON object (no markdown, no code blocks, no explanation) with keys: "
-    "intent (QUERY_VENDORS|PLAN_EVENT|GENERAL_Q|CLARIFY|VENDOR_INFO) and "
+    "intent (QUERY_VENDORS|PLAN_EVENT|GENERAL_Q|CLARIFY|VENDOR_INFO|GREETING) and "
     "slots {city,date,service_type,event_type,budget,vendor_name} where available. "
     "Use VENDOR_INFO intent when user asks about specific vendor details/contact. "
     "Dates in YYYY-MM-DD format, budget as integer. "
@@ -876,7 +876,25 @@ async def chat_optimized(body: ChatIn):
         intent_obj = await extract_intent_fast(body.message)
         slots = intent_obj.get("slots", {}) or {}
         intent = intent_obj.get("intent", "CLARIFY")
-        
+        if intent == "GREETING":
+            reply = (
+                "Hi! I'm Zing — your event vendor assistant. 🤖\n\n"
+                "I can help you find vendors (photography, catering, decoration, makeup, cleaning, etc.) "
+                "and compare prices. Tell me your city, date (YYYY-MM-DD), service type, and budget, "
+                "and I'll find suitable vendors and recommendations.\n\n"
+                "Examples:\n"
+                "• \"Find a photographer in Chennai on 2025-10-24\"\n"
+                "• \"Catering in Mumbai for 20000\"\n\n"
+                "How can I help you today?"
+            )
+            processing_time = time.time() - start_time
+            return ChatOut(
+                reply=reply,
+                intent=intent_obj,
+                slots=slots,
+                recommendations=[],
+                processing_time=round(processing_time, 3)
+            )
         service_types = []
         if slots.get("service_type"):
             raw_services = slots["service_type"]
