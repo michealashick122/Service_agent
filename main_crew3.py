@@ -23,7 +23,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("event-planner")
 
-# === SETTINGS ===
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://postgres:Admin@localhost:5432/agentspace"
     OPENAI_API_KEY: Optional[str] = None
@@ -48,7 +47,6 @@ settings = Settings()
 if settings.OPENAI_API_KEY:
     openai.api_key = settings.OPENAI_API_KEY
 
-# === CACHING ===
 vendor_cache = TTLCache(maxsize=settings.MAX_CACHE_SIZE, ttl=settings.CACHE_TTL)
 
 def cache_key(**kwargs) -> str:
@@ -83,7 +81,6 @@ AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSes
 # === CONVERSATION MEMORY ===
 conversations: Dict[str, Dict] = {}
 
-# === SERVICE MAPPING ===
 SERVICE_MAP = {
     "photographer": "camera", "photography": "camera", "photo": "camera",
     "cameraman": "camera", "photos": "camera", "picture": "camera",
@@ -142,13 +139,19 @@ async def search_vendors(
         return vendor_list
 
 async def get_available_service_types(city: Optional[str] = None) -> List[str]:
-    """Get distinct service types"""
+    """Get distinct service types with caching"""
+    cache_k = f"service_types_{city or 'all'}"
+    if cache_k in vendor_cache:
+        return vendor_cache[cache_k]
+    
     async with AsyncSessionLocal() as session:
         stmt = select(Vendor.service_type).distinct()
         if city:
             stmt = stmt.where(func.lower(Vendor.city) == city.lower())
         result = await session.execute(stmt)
-        return [row[0] for row in result.fetchall()]
+        service_types = [row[0] for row in result.fetchall()]
+        vendor_cache[cache_k] = service_types
+        return service_types
 
 TOOLS = [
     {
@@ -217,11 +220,11 @@ async def execute_function(name: str, arguments: Dict) -> str:
         log.error(f"Function execution error: {e}")
         return json.dumps({"error": str(e)})
 
-# === MAIN AI PLANNER ===
 class IntelligentEventPlanner:
     """AI-powered conversational event planner with function calling"""
     
-    SYSTEM_PROMPT = """You are an expert event planning assistant specializing in Indian weddings and events. 
+    def __init__(self):
+        self.system_prompt_base = """You are an expert event planning assistant specializing in Indian weddings and events. 
 
 Your role:
 - Help users plan events by understanding their needs
@@ -238,35 +241,43 @@ CRITICAL RULES:
 5. For multi-day weddings, explain what vendors are typically needed
 6. Always provide specific vendor details: name, price range, and contact when available
 
-Available vendor service types:
-- camera (photography)
-- videography
-- food (catering)
-- decoration
-- cleaning
-- makeup
-- event planning
-
 For comprehensive event planning:
 - Ask about: city, date, number of guests, budget, specific services needed
 - Suggest typical vendor combinations for events
 - Help prioritize based on budget
 
-Be conversational and helpful like a real event planner would be!"""
+Available vendor service types: {service_types}
 
+Be conversational and helpful like a real event planner would be!"""
+        self.cached_system_prompt = None
+    
+    async def get_system_prompt(self) -> str:
+        """Get system prompt with dynamic service types"""
+        if self.cached_system_prompt:
+            return self.cached_system_prompt
+        
+        service_types = await get_available_service_types()
+        service_list = "\n".join([f"- {st}" for st in service_types])
+        
+        self.cached_system_prompt = self.system_prompt_base.format(
+            service_types=service_list
+        )
+        return self.cached_system_prompt
+    
     async def process(self, message: str, session_id: str = None) -> Dict:
         """Process conversation with AI function calling"""
         
         if session_id not in conversations:
+            system_prompt = await self.get_system_prompt()
             conversations[session_id] = {
-                "messages": [{"role": "system", "content": self.SYSTEM_PROMPT}],
+                "messages": [{"role": "system", "content": system_prompt}],
                 "context": {}
             }
         
         conv = conversations[session_id]
         
         conv["messages"].append({"role": "user", "content": message})
-        
+                
         if len(conv["messages"]) > 15:
             conv["messages"] = [conv["messages"][0]] + conv["messages"][-14:]
         
@@ -285,6 +296,7 @@ Be conversational and helpful like a real event planner would be!"""
             assistant_message = response.choices[0].message
             
             if assistant_message.tool_calls:
+                # Add assistant message with function call
                 conv["messages"].append({
                     "role": "assistant",
                     "content": assistant_message.content,
@@ -301,6 +313,7 @@ Be conversational and helpful like a real event planner would be!"""
                     ]
                 })
                 
+                # Execute functions
                 for tool_call in assistant_message.tool_calls:
                     func_name = tool_call.function.name
                     func_args = json.loads(tool_call.function.arguments)
@@ -309,12 +322,14 @@ Be conversational and helpful like a real event planner would be!"""
                     
                     result = await execute_function(func_name, func_args)
                     
+                    # Add function result
                     conv["messages"].append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": result
                     })
                 
+                # Get final response after function execution
                 final_response = await asyncio.to_thread(
                     openai.chat.completions.create,
                     model=settings.OPENAI_MODEL,
@@ -416,18 +431,28 @@ async def reset_session(session_id: str):
     """Reset a conversation session"""
     if session_id in conversations:
         del conversations[session_id]
+    planner.cached_system_prompt = None
     return {"message": f"Session {session_id} reset"}
 
 @app.post("/clear-cache")
 async def clear_cache():
+    """Clear all caches"""
     vendor_cache.clear()
-    return {"message": "Cache cleared"}
+    planner.cached_system_prompt = None
+    return {"message": "All caches cleared"}
+
+@app.get("/service-types")
+async def get_service_types(city: Optional[str] = None):
+    """Get available service types"""
+    service_types = await get_available_service_types(city)
+    return {"service_types": service_types, "city": city}
 
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
+    # Warm up cache
     cities = ["Chennai", "Mumbai", "Delhi", "Bangalore"]
     services = ["camera", "food", "decoration", "makeup", "videography"]
     

@@ -259,7 +259,7 @@ class AIServiceMapper:
     def __init__(self):
         self._db_service_types: Set[str] = set()
         self._initialized = False
-        self._mapping_cache: Dict[str, List[str]] = {}  # Cache AI mappings
+        self._mapping_cache: Dict[str, List[str]] = {}  
     
     async def initialize(self, engine):
         """Fetch distinct service types from database"""
@@ -308,7 +308,7 @@ class AIServiceMapper:
                 t.lower() for t in ai_mapping 
                 if t.lower() in self._db_service_types
             ]
-            
+            print(validated_types, "<<<<<<<---- Validated Types from _ai_map_service")
             if validated_types:
                 log.info(f"🤖 AI mapped '{user_input}' -> {validated_types}")
                 self._mapping_cache[user_input_lower] = validated_types
@@ -384,10 +384,10 @@ Example format: ["service1", "service2"]"""
                 start = response_clean.find("[")
                 end = response_clean.rfind("]") + 1
                 if start != -1 and end > start:
-                    response_clean = response_clean[start:end]
-            
+                    response_clean = response_clean[start:end]        
             # Parse JSON
             mapped_types = json.loads(response_clean)
+            print(mapped_types, "<<<<<-- AI mapped service types for " , user_service)
             
             if isinstance(mapped_types, list):
                 log.info(f"🤖 AI raw response for '{user_service}': {mapped_types}")
@@ -874,9 +874,10 @@ async def chat_optimized(body: ChatIn):
     start_time = time.time()    
     try:
         intent_obj = await extract_intent_fast(body.message)
-        slots = intent_obj.get("slots", {}) or {}
+        log.info(f"Level 1 Extraction:{intent_obj}")
+        slots = intent_obj.get("slots", {}) or {}        
         intent = intent_obj.get("intent", "CLARIFY")
-        if intent == "GREETING":
+        if intent == "GREETING" or intent == "GENERAL_Q":
             reply = (
                 "Hi! I'm Zing — your event vendor assistant. 🤖\n\n"
                 "I can help you find vendors (photography, catering, decoration, makeup, cleaning, etc.) "
@@ -1231,42 +1232,6 @@ async def startup_optimized():
                 log.info(f"✅ Created index: {index_sql.split()[5] if len(index_sql.split()) > 5 else 'index'}")
             except Exception as e:
                 log.warning(f"⚠️ Index creation failed (may already exist): {e}")
-    
-    # Seed data
-    # if settings.SEED_DATA:
-    #     async with AsyncSessionLocal() as ses:
-    #         existing = (await ses.execute(select(Vendor))).scalars().first()
-    #         if not existing:
-    #             vendors = [
-    #                 Vendor(name="Royal Caterers", service_type="food", city="Chennai",
-    #                        price_min=15000, price_max=60000, available_date=date(2025, 10, 24), contact="99999 11111"),
-    #                 Vendor(name="Elite Photography", service_type="camera", city="Chennai",
-    #                        price_min=12000, price_max=45000, available_date=date(2025, 10, 24), contact="99999 22222"),
-    #                 Vendor(name="Floral Decors", service_type="decoration", city="Chennai",
-    #                        price_min=8000, price_max=40000, available_date=date(2025, 10, 24), contact="99999 33333"),
-    #                 Vendor(name="Sparkle Cleaners", service_type="cleaning", city="Chennai",
-    #                        price_min=3000, price_max=12000, available_date=date(2025, 10, 24), contact="99999 44444"),
-    #                 Vendor(name="GlamUp Makeup", service_type="makeup", city="Chennai",
-    #                        price_min=5000, price_max=25000, available_date=date(2025, 10, 24), contact="99999 55555"),
-    #                 Vendor(name="Mumbai Delights", service_type="food", city="Mumbai",
-    #                        price_min=20000, price_max=80000, available_date=date(2025, 10, 24), contact="99999 66666"),
-    #                 Vendor(name="Pixel Perfect Studios", service_type="camera", city="Mumbai",
-    #                        price_min=15000, price_max=50000, available_date=date(2025, 10, 24), contact="99999 77777"),
-    #                 Vendor(name="Bloom & Blossom", service_type="decoration", city="Bangalore",
-    #                        price_min=10000, price_max=45000, available_date=date(2025, 10, 24), contact="99999 88888"),
-    #                 Vendor(name="Luxe Photography", service_type="camera", city="Delhi",
-    #                        price_min=20000, price_max=60000, available_date=date(2025, 10, 30), contact="99999 99999"),
-    #                 Vendor(name="Capital Events", service_type="food", city="Delhi",
-    #                        price_min=25000, price_max=75000, available_date=date(2025, 10, 30), contact="99999 10101"),
-    #                 Vendor(name="Delhi Decorators", service_type="decoration", city="Delhi",
-    #                        price_min=15000, price_max=50000, available_date=date(2025, 10, 30), contact="99999 10102"),
-    #                 # 🆕 Add the photography vendor from your DB
-    #                 Vendor(name="Michel clicks", service_type="photography", city="Chennai",
-    #                        price_min=10000, price_max=20000, available_date=date(2025, 10, 24), contact="97912 61288"),
-    #             ]
-    #             ses.add_all(vendors)
-    #             await ses.commit()
-    #             log.info("✅ Seed data added with optimized indexes")
     
     # 🆕 CRITICAL: Initialize the AI service mapper
     await service_mapper.initialize(engine)
