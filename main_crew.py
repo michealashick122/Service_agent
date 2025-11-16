@@ -3,72 +3,111 @@ import json
 import time
 import logging
 import asyncio
-from datetime import date, datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple, Set
-from functools import lru_cache
+from datetime import date, datetime
+from typing import Optional, List, Dict, Any
 import hashlib
-import httpx
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, status, BackgroundTasks
+import re
+
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
 from pydantic_settings import BaseSettings
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Integer, Date as SQLDate, select, text
-
-# CrewAI imports
-from crewai import Agent, Task, Crew, LLM as CrewLLM, Process
-from crewai.tools import BaseTool
+from sqlalchemy import String, Integer, Date as SQLDate, select, func, Text
+from cachetools import TTLCache
+from crewai import Agent, Task, Crew, Process
+from crewai_tools import tool
+from langchain_openai import ChatOpenAI
+import openai
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format='{"ts":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}',
+    format='{"ts":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s","trace_id":"%(trace_id)s"}',
 )
 log = logging.getLogger("crewai-event-planner")
 
 # === SETTINGS ===
 class Settings(BaseSettings):
-    API_KEY: Optional[str] = None
     DATABASE_URL: str = "postgresql+asyncpg://postgres:Admin@localhost:5432/agentspace"
     OPENAI_API_KEY: Optional[str] = None
-    OPENAI_MODEL: str = "gpt-3.5-turbo"
-    SEED_DATA: bool = True
+    OPENAI_MODEL: str = "gpt-4o-mini"
     CORS_ORIGINS: List[str] = ["*"]
-    RATE_LIMIT_RPS: float = 5.0
+    CACHE_TTL: int = 300
+    MAX_CACHE_SIZE: int = 1000
     
-    ENABLE_VENDOR_CACHE: bool = True
-    ENABLE_LLM_CACHE: bool = True
+    API_KEY: Optional[str] = None
+    RATE_LIMIT_RPS: float = 5.0
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
-    LLM_TIMEOUT: int = 30
-    PARALLEL_PROCESSING: bool = True
+    
+    # AI Guardrails
+    MAX_MESSAGE_LENGTH: int = 2000
+    MAX_TOKENS_PER_REQUEST: int = 1500
+    CONVERSATION_TIMEOUT: int = 30
+    MAX_FUNCTION_CALLS: int = 5
+    ENABLE_CONTENT_FILTERING: bool = True
+    MAX_BUDGET: int = 10000000  # 1 crore max
+    
+    # Security
+    ENABLE_RATE_LIMITING: bool = True
+    MAX_REQUESTS_PER_MINUTE: int = 30
+    SESSION_TIMEOUT_MINUTES: int = 60
+    
+    # Monitoring
+    ENABLE_METRICS: bool = True
+    ALERT_EMAIL: Optional[str] = None
 
     class Config:
         env_file = ".env"
         case_sensitive = False
-        extra = "allow"
+        extra = "ignore"
 
 settings = Settings()
 
-# === DATABASE MODELS ===
+if settings.OPENAI_API_KEY:
+    openai.api_key = settings.OPENAI_API_KEY
+    os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
+
+# === CACHING ===
+vendor_cache = TTLCache(maxsize=settings.MAX_CACHE_SIZE, ttl=settings.CACHE_TTL)
+rate_limit_cache = TTLCache(maxsize=10000, ttl=60)
+
+def cache_key(**kwargs) -> str:
+    key_data = json.dumps(kwargs, sort_keys=True)
+    return hashlib.md5(key_data.encode()).hexdigest()
+
+# === DATABASE ===
 class Base(DeclarativeBase):
     pass
 
 class Vendor(Base):
     __tablename__ = "vendors"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    name: Mapped[str] = mapped_column(String(255), index=True) 
-    service_type: Mapped[str] = mapped_column(String(100), index=True) 
-    city: Mapped[str] = mapped_column(String(100), index=True)  
-    price_min: Mapped[int] = mapped_column(Integer, index=True)  
-    price_max: Mapped[int] = mapped_column(Integer, index=True)  
-    available_date: Mapped[Optional[date]] = mapped_column(SQLDate, nullable=True, index=True)  
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    service_type: Mapped[str] = mapped_column(String(100), index=True)
+    city: Mapped[str] = mapped_column(String(100), index=True)
+    price_min: Mapped[int] = mapped_column(Integer)
+    price_max: Mapped[int] = mapped_column(Integer)
+    available_date: Mapped[Optional[date]] = mapped_column(SQLDate, nullable=True)
     contact: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    timestamp: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    session_id: Mapped[str] = mapped_column(String(255), index=True)
+    user_message: Mapped[str] = mapped_column(Text)
+    ai_response: Mapped[str] = mapped_column(Text)
+    function_calls: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    processing_time: Mapped[float] = mapped_column()
+    success: Mapped[bool] = mapped_column()
+    trace_id: Mapped[str] = mapped_column(String(64), index=True)
+
 engine = create_async_engine(
-    settings.DATABASE_URL, 
-    echo=False, 
-    future=True,
+    settings.DATABASE_URL,
+    echo=False,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,
     pool_recycle=3600,
@@ -76,465 +115,392 @@ engine = create_async_engine(
 )
 AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-# === CREWAI TOOLS ===
-class VendorSearchTool(BaseTool):
-    name: str = "Vendor Search Tool"
-    description: str = """Search for vendors in the database based on criteria.
-    Input should be a JSON string with fields: city, service_type, date (YYYY-MM-DD), budget.
-    Returns list of matching vendors with their details."""
-    
-    async def _arun(self, query: str) -> str:
-        """Async search for vendors"""
-        try:
-            criteria = json.loads(query)
-            vendors = await self._fetch_vendors(criteria)
-            
-            if not vendors:
-                return "No vendors found matching the criteria."
-            
-            result = []
-            for v in vendors:
-                result.append({
-                    "id": v.id,
-                    "name": v.name,
-                    "service_type": v.service_type,
-                    "city": v.city,
-                    "price_range": f"₹{v.price_min:,} - ₹{v.price_max:,}",
-                    "price_min": v.price_min,
-                    "price_max": v.price_max,
-                    "available_date": v.available_date.isoformat() if v.available_date else None,
-                    "contact": v.contact
-                })
-            
-            return json.dumps(result, indent=2)
-            
-        except json.JSONDecodeError:
-            return "Error: Invalid JSON input. Please provide valid JSON with search criteria."
-        except Exception as e:
-            log.error(f"Vendor search error: {e}")
-            return f"Error searching vendors: {str(e)}"
-    
-    def _run(self, query: str) -> str:
-        """Sync wrapper for async run"""
-        return asyncio.run(self._arun(query))
-    
-    async def _fetch_vendors(self, criteria: Dict[str, Any]) -> List[Vendor]:
-        """Fetch vendors from database"""
-        async with AsyncSessionLocal() as ses:
-            stmt = select(Vendor)
-            filters = []
-            
-            if criteria.get("city"):
-                from sqlalchemy import func
-                filters.append(func.lower(Vendor.city) == criteria["city"].lower())
-            
-            if criteria.get("service_type"):
-                from sqlalchemy import func
-                service_types = criteria["service_type"]
-                if isinstance(service_types, str):
-                    service_types = [service_types]
-                
-                from sqlalchemy import or_
-                service_filters = [
-                    func.lower(Vendor.service_type) == st.lower() 
-                    for st in service_types
-                ]
-                filters.append(or_(*service_filters))
-            
-            if criteria.get("date"):
-                try:
-                    y, m, d = map(int, criteria["date"].split("-"))
-                    target_date = date(y, m, d)
-                    filters.append(Vendor.available_date == target_date)
-                except:
-                    pass
-            
-            if criteria.get("budget"):
-                budget = int(criteria["budget"])
-                filters.append(Vendor.price_min <= budget)
-            
-            if filters:
-                from sqlalchemy import and_
-                stmt = stmt.where(and_(*filters))
-            
-            result = await ses.execute(stmt)
-            return list(result.scalars().all())
+# === CONVERSATION MEMORY ===
+conversations: Dict[str, Dict] = {}
 
+# === CONTENT FILTERING ===
+class ContentFilter:
+    """Filter inappropriate content and enforce guardrails"""
+    
+    BLOCKED_PATTERNS = [
+        r'\b(hack|exploit|vulnerability|sql injection|xss)\b',
+        r'\b(credit card|ssn|social security)\b',
+        r'\b(illegal|fraud|scam)\b',
+    ]
+    
+    SPAM_PATTERNS = [
+        r'(.)\1{10,}',  # Repeated characters
+        r'(https?://[^\s]+){3,}',  # Multiple URLs
+    ]
+    
+    @staticmethod
+    def is_safe(text: str) -> tuple[bool, Optional[str]]:
+        """Check if content is safe"""
+        if not text or len(text.strip()) == 0:
+            return False, "Empty message"
+        
+        if len(text) > settings.MAX_MESSAGE_LENGTH:
+            return False, f"Message too long (max {settings.MAX_MESSAGE_LENGTH} chars)"
+        
+        text_lower = text.lower()
+        
+        # Check blocked patterns
+        for pattern in ContentFilter.BLOCKED_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return False, "Message contains prohibited content"
+        
+        # Check spam patterns
+        for pattern in ContentFilter.SPAM_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return False, "Message appears to be spam"
+        
+        return True, None
+    
+    @staticmethod
+    def sanitize_output(text: str) -> str:
+        """Sanitize AI output"""
+        # Remove potential PII patterns
+        text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED]', text)
+        text = re.sub(r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b', '[REDACTED]', text)
+        return text
 
-class BudgetOptimizerTool(BaseTool):
-    name: str = "Budget Optimizer Tool"
-    description: str = """Finds the best combination of vendors within budget.
-    Input should be JSON with: vendors (list), services_needed (list), budget (int).
-    Returns optimal vendor combination and cost breakdown."""
+# === RATE LIMITING ===
+class RateLimiter:
+    """Rate limiting for API endpoints"""
     
-    def _run(self, query: str) -> str:
-        """Sync run"""
-        return asyncio.run(self._arun(query))
+    @staticmethod
+    def check_rate_limit(session_id: str) -> tuple[bool, Optional[str]]:
+        """Check if request is within rate limit"""
+        if not settings.ENABLE_RATE_LIMITING:
+            return True, None
+        
+        current_time = time.time()
+        key = f"rate_{session_id}"
+        
+        if key in rate_limit_cache:
+            requests = rate_limit_cache[key]
+            # Filter requests in last minute
+            recent = [t for t in requests if current_time - t < 60]
+            
+            if len(recent) >= settings.MAX_REQUESTS_PER_MINUTE:
+                return False, "Rate limit exceeded. Please wait before sending more messages."
+            
+            recent.append(current_time)
+            rate_limit_cache[key] = recent
+        else:
+            rate_limit_cache[key] = [current_time]
+        
+        return True, None
+
+# === DATABASE FUNCTIONS ===
+async def search_vendors(
+    city: Optional[str] = None,
+    service_types: Optional[List[str]] = None,
+    budget: Optional[int] = None
+) -> List[Dict]:
+    """Search vendors with caching and validation"""
     
-    async def _arun(self, query: str) -> str:
-        """Optimize vendor selection for budget"""
-        try:
-            data = json.loads(query)
-            vendors_data = data.get("vendors", [])
-            services = data.get("services_needed", [])
-            budget = data.get("budget", 0)
-            
-            if not vendors_data or not services or not budget:
-                return "Error: Missing required fields (vendors, services_needed, budget)"
-            
-            # Convert vendor dicts to objects
-            vendors = []
-            for v_data in vendors_data:
-                v = type('Vendor', (), v_data)()
-                vendors.append(v)
-            
-            # Find best combination
-            selected, total_cost, fits = await self._find_best_combination(
-                vendors, services, budget
+    # Input validation
+    if budget and (budget < 0 or budget > settings.MAX_BUDGET):
+        raise ValueError(f"Budget must be between 0 and {settings.MAX_BUDGET}")
+    
+    if city and len(city) > 100:
+        raise ValueError("City name too long")
+    
+    cache_k = cache_key(city=city, services=service_types, budget=budget)
+    
+    if cache_k in vendor_cache:
+        log.info(f"✅ Cache HIT")
+        return vendor_cache[cache_k]
+    
+    log.info(f"🔍 DB Search: {city}, {service_types}, {budget}")
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(Vendor)
+        
+        if city:
+            stmt = stmt.where(func.lower(Vendor.city) == city.lower())
+        
+        if service_types:
+            from sqlalchemy import or_
+            filters = [func.lower(Vendor.service_type) == s.lower() for s in service_types]
+            stmt = stmt.where(or_(*filters))
+        
+        if budget:
+            stmt = stmt.where(Vendor.price_min <= budget)
+        
+        stmt = stmt.limit(50)
+        result = await session.execute(stmt)
+        vendors = result.scalars().all()
+        
+        vendor_list = [
+            {
+                "name": v.name,
+                "service_type": v.service_type,
+                "city": v.city,
+                "price_min": v.price_min,
+                "price_max": v.price_max,
+                "contact": v.contact,
+                "available_date": v.available_date.isoformat() if v.available_date else None
+            }
+            for v in vendors
+        ]
+        
+        vendor_cache[cache_k] = vendor_list
+        return vendor_list
+
+async def get_available_service_types(city: Optional[str] = None) -> List[str]:
+    """Get distinct service types with caching"""
+    cache_k = f"service_types_{city or 'all'}"
+    if cache_k in vendor_cache:
+        return vendor_cache[cache_k]
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(Vendor.service_type).distinct()
+        if city:
+            stmt = stmt.where(func.lower(Vendor.city) == city.lower())
+        result = await session.execute(stmt)
+        service_types = [row[0] for row in result.fetchall()]
+        vendor_cache[cache_k] = service_types
+        return service_types
+
+async def log_interaction(
+    session_id: str,
+    user_message: str,
+    ai_response: str,
+    function_calls: Optional[str],
+    processing_time: float,
+    success: bool,
+    trace_id: str
+):
+    """Log interaction to database for audit trail"""
+    try:
+        async with AsyncSessionLocal() as session:
+            audit = AuditLog(
+                session_id=session_id,
+                user_message=user_message[:1000],  # Truncate if too long
+                ai_response=ai_response[:2000],
+                function_calls=function_calls,
+                processing_time=processing_time,
+                success=success,
+                trace_id=trace_id
             )
-            
-            result = {
-                "fits_budget": fits,
-                "total_min_cost": total_cost,
-                "budget": budget,
-                "selected_vendors": [
-                    {
-                        "name": v.name,
-                        "service_type": v.service_type,
-                        "price_min": v.price_min,
-                        "price_max": v.price_max,
-                        "contact": v.contact
-                    } for v in selected
-                ],
-                "budget_utilization": f"{int(total_cost/budget*100)}%" if budget > 0 else "N/A"
-            }
-            
-            return json.dumps(result, indent=2)
-            
-        except Exception as e:
-            log.error(f"Budget optimization error: {e}")
-            return f"Error optimizing budget: {str(e)}"
+            session.add(audit)
+            await session.commit()
+    except Exception as e:
+        log.error(f"Failed to log interaction: {e}")
+
+# === CREWAI TOOLS ===
+@tool("Search Vendors")
+async def search_vendors_tool(
+    city: Optional[str] = None,
+    service_types: Optional[List[str]] = None,
+    budget: Optional[int] = None
+) -> str:
+    """
+    Search for event vendors in the database by city, service type, and budget.
     
-    async def _find_best_combination(self, vendors: List, services: List[str], 
-                                     budget: int) -> Tuple[List, int, bool]:
-        """Find optimal vendor combination"""
-        from itertools import product
-        
-        vendors_by_service = {}
-        for service in services:
-            vendors_by_service[service] = [
-                v for v in vendors if v.service_type.lower() == service.lower()
-            ]
-        
-        missing = [s for s in services if not vendors_by_service.get(s)]
-        if missing:
-            available = [v for v in vendors if v.service_type in services]
-            total = sum(v.price_min for v in available)
-            return available, total, False
-        
-        service_lists = [vendors_by_service[s] for s in services]
-        all_combos = list(product(*service_lists))
-        
-        valid_combos = []
-        for combo in all_combos:
-            min_cost = sum(v.price_min for v in combo)
-            if min_cost <= budget:
-                valid_combos.append({
-                    "vendors": combo,
-                    "cost": min_cost,
-                    "score": budget - min_cost
-                })
-        
-        if not valid_combos:
-            cheapest = min(all_combos, key=lambda c: sum(v.price_min for v in c))
-            return list(cheapest), sum(v.price_min for v in cheapest), False
-        
-        valid_combos.sort(key=lambda x: x["score"], reverse=True)
-        best = valid_combos[0]
-        
-        return list(best["vendors"]), best["cost"], True
-
-
-class ServiceMapperTool(BaseTool):
-    name: str = "Service Type Mapper"
-    description: str = """Maps user service requests to database service types.
-    Input: user's service request (e.g., 'photographer', 'catering')
-    Output: JSON list of matching database service types."""
+    Args:
+        city: City name (e.g., Chennai, Mumbai, Delhi, Bangalore)
+        service_types: List of service types (camera, videography, food, decoration, etc.)
+        budget: Maximum budget in rupees
     
-    def _run(self, query: str) -> str:
-        return asyncio.run(self._arun(query))
+    Returns:
+        JSON string with vendor list and count
+    """
+    try:
+        vendors = await search_vendors(city, service_types, budget)
+        return json.dumps({"vendors": vendors, "count": len(vendors)})
+    except Exception as e:
+        log.error(f"Search vendors tool error: {e}")
+        return json.dumps({"error": str(e), "vendors": [], "count": 0})
+
+@tool("Get Service Types")
+async def get_service_types_tool(city: Optional[str] = None) -> str:
+    """
+    Get list of available service types/vendor categories.
     
-    async def _arun(self, query: str) -> str:
-        """Map service types using AI"""
-        try:
-            # Get available service types from DB
-            async with AsyncSessionLocal() as ses:
-                result = await ses.execute(
-                    text("SELECT DISTINCT service_type FROM vendors")
-                )
-                db_types = [row[0] for row in result.fetchall()]
-            
-            # Simple mapping logic (can be enhanced with LLM)
-            query_lower = query.lower().strip()
-            
-            mapping = {
-                "photo": ["camera", "photography"],
-                "photographer": ["camera", "photography"],
-                "photography": ["camera", "photography"],
-                "camera": ["camera", "photography"],
-                "cameraman": ["camera", "photography"],
-                "catering": ["food"],
-                "caterer": ["food"],
-                "meals": ["food"],
-                "food": ["food"],
-                "decor": ["decoration"],
-                "decoration": ["decoration"],
-                "flowers": ["decoration"],
-                "cleaning": ["cleaning"],
-                "cleaner": ["cleaning"],
-                "makeup": ["makeup"],
-                "beauty": ["makeup"]
-            }
-            
-            matched = mapping.get(query_lower, [query_lower])
-            
-            # Filter to only DB types
-            valid = [t for t in matched if t.lower() in [dt.lower() for dt in db_types]]
-            
-            if not valid:
-                valid = [query_lower]
-            
-            return json.dumps(valid)
-            
-        except Exception as e:
-            return json.dumps([query.lower()])
+    Args:
+        city: Optional city to filter service types
+    
+    Returns:
+        JSON string with available service types
+    """
+    try:
+        service_types = await get_available_service_types(city)
+        return json.dumps({"service_types": service_types})
+    except Exception as e:
+        log.error(f"Get service types tool error: {e}")
+        return json.dumps({"error": str(e), "service_types": []})
 
-
+# === CREWAI AGENTS ===
 class EventPlannerCrew:
-    """Main CrewAI orchestration for event planning"""
+    """CrewAI-based event planning system with multiple specialized agents"""
     
     def __init__(self):
-        self.llm = CrewLLM(
+        self.llm = ChatOpenAI(
             model=settings.OPENAI_MODEL,
-            api_key=settings.OPENAI_API_KEY
-        ) if settings.OPENAI_API_KEY else None
-        
-        # Initialize tools
-        self.vendor_search_tool = VendorSearchTool()
-        self.budget_optimizer_tool = BudgetOptimizerTool()
-        self.service_mapper_tool = ServiceMapperTool()
-        
-        # Create agents
-        self._create_agents()
-    
-    def _create_agents(self):
-        """Create specialized agents"""
-        
-        # 1. Intent Understanding Agent
-        self.intent_agent = Agent(
-            role="Customer Intent Analyst",
-            goal="Understand customer requirements and extract structured information",
-            backstory="""You are an expert at understanding customer needs for event planning.
-            You analyze messages to extract: city, date, service types, budget, and event details.
-            You normalize city names (bangalore->Bangalore, chennai->Chennai) and dates (YYYY-MM-DD format).""",
-            verbose=True,
-            allow_delegation=False,
-            llm=self.llm
+            temperature=0.7,
+            max_tokens=settings.MAX_TOKENS_PER_REQUEST
         )
         
-        # 2. Service Mapping Agent
-        self.mapping_agent = Agent(
-            role="Service Type Specialist",
-            goal="Map user service requests to available database service categories",
-            backstory="""You understand all service types and their synonyms.
-            You use the Service Mapper tool to find matching database service types.
-            You know that 'photography' and 'camera' are related, 'catering' means 'food', etc.""",
-            tools=[self.service_mapper_tool],
+        # Requirement Analyst Agent
+        self.requirements_agent = Agent(
+            role="Event Requirements Analyst",
+            goal="Extract and clarify event planning requirements from user conversations",
+            backstory="""You are an expert at understanding customer needs for Indian weddings 
+            and events. You ask clarifying questions when needed and extract key details like 
+            city, budget, date, number of guests, and required services.""",
+            llm=self.llm,
             verbose=True,
-            allow_delegation=False,
-            llm=self.llm
+            allow_delegation=False
         )
         
-        # 3. Vendor Search Agent
-        self.search_agent = Agent(
+        # Vendor Search Agent
+        self.vendor_agent = Agent(
             role="Vendor Search Specialist",
-            goal="Find the best matching vendors from the database",
-            backstory="""You are an expert at searching and filtering vendors.
-            You use the Vendor Search Tool to find vendors matching customer criteria.
-            You consider location, service type, availability, and budget constraints.""",
-            tools=[self.vendor_search_tool],
+            goal="Find and recommend the best vendors based on requirements",
+            backstory="""You are a vendor search expert who uses the search_vendors_tool to 
+            find suitable vendors. You ONLY recommend vendors that actually exist in the database. 
+            You provide detailed information including names, prices, and contact details.""",
+            llm=self.llm,
             verbose=True,
-            allow_delegation=False,
-            llm=self.llm
+            tools=[search_vendors_tool, get_service_types_tool],
+            allow_delegation=False
         )
         
-        # 4. Budget Optimization Agent
-        self.budget_agent = Agent(
-            role="Budget Optimization Expert",
-            goal="Find the most cost-effective vendor combinations within budget",
-            backstory="""You are a financial expert who optimizes vendor selection.
-            You use the Budget Optimizer Tool to find the best vendor combinations.
-            You maximize value while staying within budget constraints.""",
-            tools=[self.budget_optimizer_tool],
+        # Event Coordinator Agent
+        self.coordinator_agent = Agent(
+            role="Event Coordination Expert",
+            goal="Provide comprehensive event planning advice and vendor coordination",
+            backstory="""You are an experienced event planner who helps coordinate all aspects 
+            of weddings and events. You suggest vendor combinations, help with budget allocation, 
+            and provide timeline recommendations.""",
+            llm=self.llm,
             verbose=True,
-            allow_delegation=False,
-            llm=self.llm
-        )
-        
-        # 5. Response Formatter Agent
-        self.formatter_agent = Agent(
-            role="Customer Communication Specialist",
-            goal="Create clear, helpful responses for customers",
-            backstory="""You are an expert at customer communication.
-            You create friendly, informative responses that include vendor details,
-            pricing, contact information, and helpful recommendations.""",
-            verbose=True,
-            allow_delegation=False,
-            llm=self.llm
+            allow_delegation=True
         )
     
-    async def process_query(self, user_message: str) -> Dict[str, Any]:
-        """Process user query through CrewAI agents"""
+    async def process_message(
+        self,
+        message: str,
+        context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Process user message through CrewAI agents"""
         
-        # Task 1: Extract Intent
-        intent_task = Task(
-            description=f"""Analyze this customer message and extract structured information:
-            
-            Message: "{user_message}"
-            
-            Extract:
-            - intent: (QUERY_VENDORS, VENDOR_INFO, PLAN_EVENT, GENERAL_Q, CLARIFY)
-            - city: normalized city name (Chennai, Mumbai, Delhi, Bangalore)
-            - date: in YYYY-MM-DD format if mentioned
-            - service_type: what services they need (can be multiple)
-            - budget: numeric budget if mentioned
-            - vendor_name: if asking about specific vendor
-            - event_type: type of event if mentioned
-            
-            Return ONLY valid JSON with these fields.""",
-            agent=self.intent_agent,
-            expected_output="JSON object with extracted intent and slots"
-        )
-        
-        # Task 2: Map Services
-        service_mapping_task = Task(
-            description="""Using the extracted service_type from previous task,
-            use the Service Type Mapper tool to find matching database service types.
-            
-            Handle multiple services if needed (comma-separated).
-            
-            Return JSON list of mapped service types.""",
-            agent=self.mapping_agent,
-            expected_output="JSON array of database service types",
-            context=[intent_task]
-        )
-        
-        # Task 3: Search Vendors
-        vendor_search_task = Task(
-            description="""Using the extracted criteria and mapped service types,
-            use the Vendor Search Tool to find matching vendors.
-            
-            Build a JSON search query with: city, service_type (from mapping), date, budget.
-            
-            Return the full vendor list from the tool.""",
-            agent=self.search_agent,
-            expected_output="JSON array of matching vendors",
-            context=[intent_task, service_mapping_task]
-        )
-        
-        # Task 4: Optimize Budget (conditional)
-        budget_optimization_task = Task(
-            description="""If multiple services are needed AND a budget is specified,
-            use the Budget Optimizer Tool to find the best vendor combination.
-            
-            Input: vendors list, services needed, budget
-            
-            Return optimized selection and cost breakdown.""",
-            agent=self.budget_agent,
-            expected_output="JSON with optimized vendor combination and costs",
-            context=[intent_task, service_mapping_task, vendor_search_task]
-        )
-        
-        # Task 5: Format Response
-        response_task = Task(
-            description="""Create a friendly, informative response for the customer.
-            
-            Include:
-            - Clear summary of what was found
-            - Vendor details (name, service, price range, contact)
-            - Budget analysis if applicable
-            - Helpful next steps or recommendations
-            
-            Use proper formatting with bullet points and clear sections.
-            
-            Return JSON with: {
-                "reply": "formatted response text",
-                "recommendations": [list of vendor objects]
-            }""",
-            agent=self.formatter_agent,
-            expected_output="JSON with formatted reply and recommendations",
-            context=[intent_task, vendor_search_task, budget_optimization_task]
-        )
-        
-        # Create and run crew
-        crew = Crew(
-            agents=[
-                self.intent_agent,
-                self.mapping_agent,
-                self.search_agent,
-                self.budget_agent,
-                self.formatter_agent
-            ],
-            tasks=[
-                intent_task,
-                service_mapping_task,
-                vendor_search_task,
-                budget_optimization_task,
-                response_task
-            ],
-            process=Process.sequential,
-            verbose=True
-        )
-        
-        # Execute crew
         try:
-            result = await asyncio.to_thread(crew.kickoff)
-            
-            # Parse final result
-            final_output = str(result)
-            
-            # Try to extract JSON from result
-            try:
-                if "{" in final_output:
-                    start = final_output.find("{")
-                    end = final_output.rfind("}") + 1
-                    json_str = final_output[start:end]
-                    parsed = json.loads(json_str)
-                    return parsed
-                else:
-                    return {
-                        "reply": final_output,
-                        "recommendations": []
-                    }
-            except:
-                return {
-                    "reply": final_output,
-                    "recommendations": []
-                }
+            # Create tasks
+            requirement_task = Task(
+                description=f"""
+                Analyze this user message and extract event planning requirements:
                 
-        except Exception as e:
-            log.error(f"CrewAI execution error: {e}")
+                User message: {message}
+                Previous context: {json.dumps(context)}
+                
+                Identify:
+                - City/location
+                - Event type (wedding, birthday, corporate, etc.)
+                - Budget
+                - Required services
+                - Number of guests
+                - Date/timeline
+                - Any specific preferences
+                
+                If critical information is missing, formulate 1-2 clarifying questions.
+                """,
+                agent=self.requirements_agent,
+                expected_output="Structured analysis of requirements and any clarifying questions needed"
+            )
+            
+            vendor_search_task = Task(
+                description=f"""
+                Based on the requirements analysis, search for suitable vendors.
+                
+                Use the search_vendors_tool and get_service_types_tool as needed.
+                
+                CRITICAL RULES:
+                1. ONLY mention vendors returned by the search tools
+                2. NEVER invent vendor names or details
+                3. Provide specific names, price ranges, and contact information
+                4. If no vendors found, explain why and suggest alternatives
+                
+                User message: {message}
+                Context: {json.dumps(context)}
+                """,
+                agent=self.vendor_agent,
+                expected_output="List of actual vendors with complete details",
+                context=[requirement_task]
+            )
+            
+            coordination_task = Task(
+                description=f"""
+                Provide a comprehensive, helpful response to the user.
+                
+                Combine the requirements analysis and vendor search results to:
+                1. Answer the user's question directly
+                2. Provide specific vendor recommendations with details
+                3. Offer additional helpful advice
+                4. Ask clarifying questions if needed
+                
+                Be conversational, friendly, and professional.
+                Focus on being genuinely helpful.
+                
+                User message: {message}
+                """,
+                agent=self.coordinator_agent,
+                expected_output="Complete, conversational response to the user",
+                context=[requirement_task, vendor_search_task]
+            )
+            
+            # Create and run crew
+            crew = Crew(
+                agents=[
+                    self.requirements_agent,
+                    self.vendor_agent,
+                    self.coordinator_agent
+                ],
+                tasks=[
+                    requirement_task,
+                    vendor_search_task,
+                    coordination_task
+                ],
+                process=Process.sequential,
+                verbose=True
+            )
+            
+            # Execute with timeout
+            result = await asyncio.wait_for(
+                asyncio.to_thread(crew.kickoff),
+                timeout=settings.CONVERSATION_TIMEOUT
+            )
+            
             return {
-                "reply": f"I encountered an error processing your request: {str(e)}",
-                "recommendations": []
+                "reply": str(result),
+                "success": True,
+                "agents_used": ["requirements", "vendor_search", "coordinator"]
+            }
+            
+        except asyncio.TimeoutError:
+            return {
+                "reply": "I'm taking longer than expected to process your request. Could you try rephrasing?",
+                "success": False
+            }
+        except Exception as e:
+            log.error(f"CrewAI processing error: {e}", exc_info=True)
+            return {
+                "reply": "I encountered an error while processing your request. Please try again.",
+                "success": False
             }
 
-
-# Initialize crew
-event_planner_crew = EventPlannerCrew()
+# === MAIN EVENT PLANNER ===
+planner_crew = EventPlannerCrew()
 
 # === FASTAPI APP ===
-app = FastAPI(title="CrewAI Event Planner", version="2.0.0")
+app = FastAPI(
+    title="CrewAI Event Planner",
+    version="6.0.0",
+    description="Production-ready AI event planner with CrewAI and comprehensive guardrails"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -544,68 +510,224 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === SCHEMAS ===
+# Request/Response Models
 class ChatIn(BaseModel):
-    message: str
-    session_id: Optional[str] = None
+    message: str = Field(..., min_length=1, max_length=settings.MAX_MESSAGE_LENGTH)
+    session_id: Optional[str] = "default"
+    
+    @validator('message')
+    def validate_message(cls, v):
+        is_safe, error = ContentFilter.is_safe(v)
+        if not is_safe:
+            raise ValueError(error)
+        return v
 
 class ChatOut(BaseModel):
     reply: str
-    recommendations: Optional[List[Dict[str, Any]]] = None
     processing_time: float
-    crew_result: Optional[str] = None
+    success: bool = True
+    trace_id: str
+    agents_used: Optional[List[str]] = None
 
-# === ENDPOINTS ===
+# Middleware for logging and monitoring
+@app.middleware("http")
+async def add_trace_id(request: Request, call_next):
+    trace_id = hashlib.md5(
+        f"{time.time()}{request.client.host}".encode()
+    ).hexdigest()
+    
+    # Add to logging context
+    old_factory = logging.getLogRecordFactory()
+    
+    def record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        record.trace_id = trace_id
+        return record
+    
+    logging.setLogRecordFactory(record_factory)
+    
+    response = await call_next(request)
+    response.headers["X-Trace-ID"] = trace_id
+    
+    logging.setLogRecordFactory(old_factory)
+    return response
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    return JSONResponse(
+        status_code=400,
+        content={"detail": str(exc), "success": False}
+    )
+
 @app.get("/healthz")
 async def healthz():
+    """Health check endpoint"""
     return {
         "status": "ok",
-        "orchestration": "CrewAI",
-        "agents": 5,
-        "tools": 3
+        "cache_size": len(vendor_cache),
+        "active_sessions": len(conversations),
+        "model": settings.OPENAI_MODEL,
+        "version": "6.0.0",
+        "guardrails_enabled": settings.ENABLE_CONTENT_FILTERING
     }
 
 @app.post("/chat", response_model=ChatOut)
-async def chat_with_crew(body: ChatIn):
-    """Main chat endpoint orchestrated by CrewAI"""
-    start_time = time.time()
+async def chat(body: ChatIn, request: Request):
+    """AI-powered chat endpoint with CrewAI"""
+    start = time.time()
+    trace_id = request.headers.get("X-Trace-ID", "unknown")
+    
+    session_id = body.session_id or "default"
+    
+    # Rate limiting
+    can_proceed, error = RateLimiter.check_rate_limit(session_id)
+    if not can_proceed:
+        raise HTTPException(status_code=429, detail=error)
+    
+    # Content filtering
+    if settings.ENABLE_CONTENT_FILTERING:
+        is_safe, error = ContentFilter.is_safe(body.message)
+        if not is_safe:
+            raise HTTPException(status_code=400, detail=error)
     
     try:
-        # Process through CrewAI
-        result = await event_planner_crew.process_query(body.message)
+        # Initialize or get conversation context
+        if session_id not in conversations:
+            conversations[session_id] = {
+                "context": {},
+                "message_count": 0,
+                "created_at": time.time()
+            }
         
-        processing_time = time.time() - start_time
+        conv = conversations[session_id]
+        conv["message_count"] += 1
+        
+        # Session timeout check
+        if time.time() - conv["created_at"] > settings.SESSION_TIMEOUT_MINUTES * 60:
+            del conversations[session_id]
+            conversations[session_id] = {
+                "context": {},
+                "message_count": 1,
+                "created_at": time.time()
+            }
+            conv = conversations[session_id]
+        
+        # Process with CrewAI
+        result = await planner_crew.process_message(
+            body.message,
+            conv["context"]
+        )
+        
+        elapsed = time.time() - start
+        
+        # Sanitize output
+        reply = ContentFilter.sanitize_output(result["reply"])
+        
+        # Log interaction
+        await log_interaction(
+            session_id=session_id,
+            user_message=body.message,
+            ai_response=reply,
+            function_calls=json.dumps(result.get("agents_used")),
+            processing_time=elapsed,
+            success=result["success"],
+            trace_id=trace_id
+        )
         
         return ChatOut(
-            reply=result.get("reply", "I couldn't process that request."),
-            recommendations=result.get("recommendations", []),
-            processing_time=round(processing_time, 3),
-            crew_result=str(result)
+            reply=reply,
+            processing_time=round(elapsed, 2),
+            success=result["success"],
+            trace_id=trace_id,
+            agents_used=result.get("agents_used")
         )
         
     except Exception as e:
         log.error(f"Chat error: {e}", exc_info=True)
-        processing_time = time.time() - start_time
+        elapsed = time.time() - start
+        
+        await log_interaction(
+            session_id=session_id,
+            user_message=body.message,
+            ai_response="Error occurred",
+            function_calls=None,
+            processing_time=elapsed,
+            success=False,
+            trace_id=trace_id
+        )
         
         return ChatOut(
-            reply=f"I encountered an error: {str(e)}",
-            recommendations=[],
-            processing_time=round(processing_time, 3)
+            reply="I encountered an error while processing your request. Please try again.",
+            processing_time=round(elapsed, 2),
+            success=False,
+            trace_id=trace_id
         )
+
+@app.post("/reset-session")
+async def reset_session(session_id: str):
+    """Reset a conversation session"""
+    if session_id in conversations:
+        del conversations[session_id]
+    return {"message": f"Session {session_id} reset", "success": True}
+
+@app.post("/clear-cache")
+async def clear_cache():
+    """Clear all caches (admin endpoint)"""
+    vendor_cache.clear()
+    rate_limit_cache.clear()
+    return {"message": "All caches cleared", "success": True}
+
+@app.get("/service-types")
+async def get_service_types(city: Optional[str] = None):
+    """Get available service types"""
+    service_types = await get_available_service_types(city)
+    return {"service_types": service_types, "city": city}
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get system metrics (monitoring endpoint)"""
+    if not settings.ENABLE_METRICS:
+        raise HTTPException(status_code=404, detail="Metrics disabled")
+    
+    return {
+        "active_sessions": len(conversations),
+        "cache_size": len(vendor_cache),
+        "rate_limit_entries": len(rate_limit_cache),
+        "total_conversations": sum(
+            conv["message_count"] for conv in conversations.values()
+        )
+    }
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database"""
+    """Startup tasks"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    log.info("🚀 CrewAI Event Planner started with full agent orchestration")
+    log.info("🚀 CrewAI Event Planner started with AI guardrails enabled")
+    log.info(f"Content filtering: {settings.ENABLE_CONTENT_FILTERING}")
+    log.info(f"Rate limiting: {settings.ENABLE_RATE_LIMITING}")
+    log.info(f"Metrics: {settings.ENABLE_METRICS}")
 
 @app.on_event("shutdown")
 async def shutdown():
+    """Cleanup on shutdown"""
     await engine.dispose()
-    log.info("🛑 Service shutdown")
+    log.info("👋 Shutting down CrewAI Event Planner")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_config={
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "format": '{"ts":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}',
+                }
+            }
+        }
+    )

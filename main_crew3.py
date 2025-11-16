@@ -23,6 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("event-planner")
 
+# === SETTINGS ===
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://postgres:Admin@localhost:5432/agentspace"
     OPENAI_API_KEY: Optional[str] = None
@@ -47,6 +48,7 @@ settings = Settings()
 if settings.OPENAI_API_KEY:
     openai.api_key = settings.OPENAI_API_KEY
 
+# === CACHING ===
 vendor_cache = TTLCache(maxsize=settings.MAX_CACHE_SIZE, ttl=settings.CACHE_TTL)
 
 def cache_key(**kwargs) -> str:
@@ -81,6 +83,7 @@ AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSes
 # === CONVERSATION MEMORY ===
 conversations: Dict[str, Dict] = {}
 
+# === SERVICE MAPPING ===
 SERVICE_MAP = {
     "photographer": "camera", "photography": "camera", "photo": "camera",
     "cameraman": "camera", "photos": "camera", "picture": "camera",
@@ -116,8 +119,7 @@ async def search_vendors(
         if service_types:
             from sqlalchemy import or_
             filters = [func.lower(Vendor.service_type) == s.lower() for s in service_types]
-            stmt = stmt.where(or_(*filters))
-        
+            stmt = stmt.where(or_(*filters))        
         if budget:
             stmt = stmt.where(Vendor.price_min <= budget)
         
@@ -153,6 +155,7 @@ async def get_available_service_types(city: Optional[str] = None) -> List[str]:
         vendor_cache[cache_k] = service_types
         return service_types
 
+# === AI FUNCTION CALLING ===
 TOOLS = [
     {
         "type": "function",
@@ -220,6 +223,7 @@ async def execute_function(name: str, arguments: Dict) -> str:
         log.error(f"Function execution error: {e}")
         return json.dumps({"error": str(e)})
 
+# === MAIN AI PLANNER ===
 class IntelligentEventPlanner:
     """AI-powered conversational event planner with function calling"""
     
@@ -243,7 +247,7 @@ CRITICAL RULES:
 
 For comprehensive event planning:
 - Ask about: city, date, number of guests, budget, specific services needed
-- Suggest typical vendor combinations for events
+-   Suggest typical vendor combinations for events
 - Help prioritize based on budget
 
 Available vendor service types: {service_types}
@@ -258,7 +262,7 @@ Be conversational and helpful like a real event planner would be!"""
         
         service_types = await get_available_service_types()
         service_list = "\n".join([f"- {st}" for st in service_types])
-        
+        print(service_list, "<<<<<<<----- service list")
         self.cached_system_prompt = self.system_prompt_base.format(
             service_types=service_list
         )
@@ -267,6 +271,7 @@ Be conversational and helpful like a real event planner would be!"""
     async def process(self, message: str, session_id: str = None) -> Dict:
         """Process conversation with AI function calling"""
         
+        # Initialize or get conversation
         if session_id not in conversations:
             system_prompt = await self.get_system_prompt()
             conversations[session_id] = {
@@ -275,12 +280,15 @@ Be conversational and helpful like a real event planner would be!"""
             }
         
         conv = conversations[session_id]
-        
+
+        # Add user message
         conv["messages"].append({"role": "user", "content": message})
-                
+        
+        # Keep last 15 messages (to stay under token limits)
         if len(conv["messages"]) > 15:
             conv["messages"] = [conv["messages"][0]] + conv["messages"][-14:]
         
+        # Call OpenAI with function calling
         try:
             response = await asyncio.to_thread(
                 openai.chat.completions.create,
@@ -294,7 +302,8 @@ Be conversational and helpful like a real event planner would be!"""
             )
             
             assistant_message = response.choices[0].message
-            
+            print("assistant message-->>>>", assistant_message)
+            # Handle function calls
             if assistant_message.tool_calls:
                 # Add assistant message with function call
                 conv["messages"].append({
@@ -312,7 +321,9 @@ Be conversational and helpful like a real event planner would be!"""
                         for tc in assistant_message.tool_calls
                     ]
                 })
-                
+                #print(conv["message"])
+                print("-----------------------")
+                print(assistant_message.tool_calls)
                 # Execute functions
                 for tool_call in assistant_message.tool_calls:
                     func_name = tool_call.function.name
@@ -373,6 +384,7 @@ Be conversational and helpful like a real event planner would be!"""
 
 planner = IntelligentEventPlanner()
 
+# === FASTAPI APP ===
 app = FastAPI(title="AI Event Planner", version="5.0.0")
 
 app.add_middleware(
@@ -406,8 +418,11 @@ async def chat(body: ChatIn):
     """AI-powered chat endpoint"""
     start = time.time()
     
+    # Use provided session_id or generate a unique one
+    session_id = body.session_id or "default"
+    
     try:
-        result = await planner.process(body.message, body.session_id)
+        result = await planner.process(body.message, session_id)
         elapsed = time.time() - start
         
         return ChatOut(
@@ -431,6 +446,7 @@ async def reset_session(session_id: str):
     """Reset a conversation session"""
     if session_id in conversations:
         del conversations[session_id]
+    # Clear cached system prompt to refresh service types
     planner.cached_system_prompt = None
     return {"message": f"Session {session_id} reset"}
 
@@ -452,18 +468,34 @@ async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    # Warm up cache
-    cities = ["Chennai", "Mumbai", "Delhi", "Bangalore"]
-    services = ["camera", "food", "decoration", "makeup", "videography"]
+    try:
+        async with AsyncSessionLocal() as session:
+            # Get all unique cities
+            city_result = await session.execute(
+                select(Vendor.city).distinct()
+            )
+            cities = [row[0] for row in city_result.fetchall()]
+            
+            service_result = await session.execute(
+                select(Vendor.service_type).distinct()
+            )
+            services = [row[0] for row in service_result.fetchall()]
+            
+            log.info(f" Warming up cache for {len(cities)} cities and {len(services)} services")
+            
+            for city in cities:
+                for service in services:
+                    try:
+                        await search_vendors(city=city, service_types=[service])
+                    except Exception as e:
+                        log.warning(f"Cache warm-up failed for {city}/{service}: {e}")
+            
+            log.info(f" Cache warmed up with {len(vendor_cache)} entries")
+            
+    except Exception as e:
+        log.error(f"Cache warm-up error: {e}")
     
-    for city in cities:
-        for service in services:
-            try:
-                await search_vendors(city=city, service_types=[service])
-            except:
-                pass
-    
-    log.info("🚀 AI Event Planner started with function calling")
+    log.info("AI Event Planner started with function calling")
 
 @app.on_event("shutdown")
 async def shutdown():
